@@ -1,0 +1,115 @@
+pipeline {
+  agent any
+
+  parameters {
+    choice(name: 'SERVICE_TYPE', choices: ['service', 'sdk', 'cloud_function'], description: 'Choose service type')
+    string(name: 'REPO_NAME', defaultValue: 'my-new-service', description: 'GitHub Repo Name')
+    string(name: 'GITHUB_ORG', defaultValue: 'my-org', description: 'GitHub Org or User')
+    choice(name: 'DEPLOY_ENV', choices: ['dev', 'staging', 'prod'], description: 'Target Environment')
+  }
+
+  environment {
+    SHARED_LIB = 'jenkins-shared-library'
+    SONARQUBE_SERVER = 'SonarQube'
+    KUBECONFIG_CRED_ID = 'kubeconfig'
+  }
+
+  stages {
+
+    stage('Initialize Boilerplate') {
+      steps {
+        script {
+          echo "Generating boilerplate for ${params.SERVICE_TYPE}"
+
+          sharedLib = library("${env.SHARED_LIB}")
+          sharedLib.generateBoilerplate(
+            type: params.SERVICE_TYPE,
+            repo: params.REPO_NAME,
+            org: params.GITHUB_ORG
+          )
+        }
+      }
+    }
+
+    stage('Create GitHub Repo') {
+      steps {
+        script {
+          sharedLib.createGitHubRepo(
+            name: params.REPO_NAME,
+            org: params.GITHUB_ORG
+          )
+        }
+      }
+    }
+
+    stage('Apply Code Rules') {
+      steps {
+        script {
+          sharedLib.applyRepoStandards(repo: params.REPO_NAME)
+        }
+      }
+    }
+
+    stage('Run SonarQube Analysis') {
+      steps {
+        withSonarQubeEnv("${SONARQUBE_SERVER}") {
+          script {
+            sh 'sonar-scanner -Dsonar.projectKey=${params.REPO_NAME}'
+          }
+        }
+      }
+    }
+
+    stage('Build and Push Docker Image') {
+      steps {
+        script {
+          dockerImage = docker.build("${params.GITHUB_ORG}/${params.REPO_NAME}:${BUILD_NUMBER}")
+          docker.withRegistry('', 'dockerhub-credentials') {
+            dockerImage.push()
+          }
+        }
+      }
+    }
+
+    stage('Deploy') {
+      when {
+        anyOf {
+          expression { params.SERVICE_TYPE == 'service' }
+          expression { params.SERVICE_TYPE == 'sdk' }
+        }
+      }
+      steps {
+        script {
+          sharedLib.deployToKubernetes(
+            env: params.DEPLOY_ENV,
+            service: params.REPO_NAME,
+            kubeCredId: KUBECONFIG_CRED_ID
+          )
+        }
+      }
+    }
+
+    stage('Deploy to Lambda') {
+      when {
+        expression { params.SERVICE_TYPE == 'cloud_function' }
+      }
+      steps {
+        script {
+          sharedLib.deployToLambda(
+            functionName: params.REPO_NAME,
+            env: params.DEPLOY_ENV
+          )
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Onboarding complete for ${params.REPO_NAME} as ${params.SERVICE_TYPE}"
+    }
+    failure {
+      echo "Pipeline failed"
+    }
+  }
+}
